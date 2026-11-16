@@ -1,0 +1,469 @@
+#!/usr/bin/env python3
+"""Music library + playback helper for the Spotify Downloader plugin.
+
+  library scan [--root DIR]                    print the library as JSON
+  library play [--root DIR] [--shuffle] [--start N] PATH...
+                                               replace MPD's queue with PATHs and play
+  library ctl toggle|next|prev|stop            control MPD
+  library ctl show|hide                        open (or focus) / close the rmpc player
+  library status                               print now-playing as JSON
+
+Tags are read straight from the ID3v2 header (no dependencies) and cached in
+~/.cache/specialkapa.spotify-dl/library.json, keyed by path, size and mtime,
+so rescans only read new or changed files.
+
+Playback goes through MPD (127.0.0.1:6600, or $MPD_HOST/$MPD_PORT), whose
+music_directory must contain the download folder. rmpc is the player window;
+closing it leaves MPD playing. mpd-mpris connects MPD to the bar's media
+widget and media keys.
+"""
+
+import argparse
+import json
+import os
+import random
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import time
+
+MAX_TRACKS = 20000
+MAX_PLAY = 5000
+MAX_FIELD = 300
+TAG_READ_LIMIT = 256 * 1024  # bytes of the ID3 header we look at (skips cover art)
+
+CACHE_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"),
+                         "specialkapa.spotify-dl")
+CACHE_FILE = os.path.join(CACHE_DIR, "library.json")
+RUNTIME_DIR = os.environ.get("XDG_RUNTIME_DIR") or CACHE_DIR
+MPD_HOST = os.environ.get("MPD_HOST", "127.0.0.1")
+MPD_PORT = os.environ.get("MPD_PORT", "6600")
+RMPC_APP_ID = "org.omarchy.rmpc"  # Wayland app id / Hyprland class of the rmpc window
+CACHE_VERSION = 2
+
+
+def clip(value, limit=MAX_FIELD):
+    s = str(value if value is not None else "")
+    return "".join(ch if ch >= " " and ch != "\x7f" else " " for ch in s).strip()[:limit]
+
+
+# ------------------------------------------------------------------- ID3 --
+
+def _syncsafe(b):
+    return (b[0] << 21) | (b[1] << 14) | (b[2] << 7) | b[3]
+
+
+def _decode_text(data):
+    if not data:
+        return []
+    enc, body = data[0], data[1:]
+    try:
+        if enc == 0:
+            text = body.decode("latin-1")
+        elif enc == 1:
+            text = body.decode("utf-16")
+        elif enc == 2:
+            text = body.decode("utf-16-be")
+        elif enc == 3:
+            text = body.decode("utf-8")
+        else:
+            return []
+    except UnicodeDecodeError:
+        text = body.decode("utf-8", "replace") if enc == 3 else ""
+    # ID3v2.4 separates multiple values with NULs; v2.3 ends with one.
+    return [p for p in text.replace("\ufeff", "").split("\x00") if p]
+
+
+def read_id3(path):
+    """Return a dict of the text frames we care about ({} if none)."""
+    with open(path, "rb") as f:
+        head = f.read(10)
+        if len(head) < 10 or head[:3] != b"ID3" or head[3] not in (3, 4):
+            return {}
+        version, flags = head[3], head[5]
+        size = _syncsafe(head[6:10])
+        data = f.read(min(size, TAG_READ_LIMIT))
+    if flags & 0x80 and version == 3:  # whole-tag unsynchronisation (rare)
+        data = data.replace(b"\xff\x00", b"\xff")
+    pos = 0
+    if flags & 0x40 and len(data) >= 4:  # extended header
+        ext = _syncsafe(data[:4]) if version == 4 else int.from_bytes(data[:4], "big") + 4
+        pos = ext
+    tags = {}
+    while pos + 10 <= len(data):
+        fid = data[pos:pos + 4]
+        if not fid.strip(b"\x00") or not fid.isalnum():
+            break
+        raw = data[pos + 4:pos + 8]
+        fsize = _syncsafe(raw) if version == 4 else int.from_bytes(raw, "big")
+        body = data[pos + 10:pos + 10 + fsize]
+        pos += 10 + fsize
+        if fsize <= 0 or len(body) < fsize:
+            break
+        name = fid.decode("ascii")
+        if name == "TXXX":
+            values = _decode_text(body)
+            if len(values) >= 2:
+                tags["TXXX:" + values[0].lower()] = values[1:]
+        elif name in ("TIT2", "TPE1", "TPE2", "TALB", "TCON", "TIT1", "TRCK"):
+            tags[name] = _decode_text(body)
+    return tags
+
+
+def track_info(path, root):
+    tags = read_id3(path)
+    first = lambda key: clip(tags.get(key, [""])[0]) if tags.get(key) else ""
+    stem = os.path.splitext(os.path.basename(path))[0]
+    file_artist, _, file_title = stem.partition(" - ")
+    artist = first("TPE1") or (file_artist if file_title else "")
+    artists = [clip(a) for a in "; ".join(tags.get("TXXX:artists", [])).split(";") if a.strip()]
+    if not artists:
+        artists = [a.strip() for a in (tags.get("TPE1") or [artist]) if a.strip()]
+    rel_dir = os.path.relpath(os.path.dirname(path), root)
+    grouping = first("TIT1") or first("TXXX:grouping") or ("" if rel_dir == "." else rel_dir.split(os.sep)[0])
+    album = first("TALB")
+    # Where the file came from: "album", "playlist" or "track". Files from
+    # before the source tag existed: an album download has album == grouping.
+    source = first("TXXX:source").lower()
+    if source not in ("album", "playlist", "track"):
+        source = "album" if album and album == grouping else ("playlist" if grouping else "track")
+    genre = first("TCON")
+    if genre.startswith("(") and ")" in genre:  # "(17)" style id3v1 genre refs
+        genre = genre.split(")", 1)[1] or genre
+    return {
+        "path": path,
+        "title": first("TIT2") or (file_title or stem),
+        "artist": artist or "Unknown artist",
+        "artists": artists[:20] or [artist or "Unknown artist"],
+        "album": album,
+        "source": source,
+        "genre": genre,
+        "grouping": grouping,
+    }
+
+
+# ------------------------------------------------------------------ scan --
+
+def load_cache():
+    try:
+        with open(CACHE_FILE) as f:
+            data = json.load(f)
+        if data.get("version") == CACHE_VERSION and isinstance(data.get("files"), dict):
+            return data["files"]
+    except (OSError, ValueError):
+        pass
+    return {}
+
+
+def save_cache(files):
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    tmp = CACHE_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"version": CACHE_VERSION, "files": files}, f, ensure_ascii=False)
+    os.replace(tmp, CACHE_FILE)
+
+
+def scan(root):
+    root = os.path.realpath(root)
+    cache = load_cache()
+    fresh, tracks = {}, []
+    if os.path.isdir(root):
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = sorted(d for d in dirnames if not d.startswith("."))
+            for name in sorted(filenames):
+                if not name.lower().endswith(".mp3") or name.startswith("."):
+                    continue
+                path = os.path.join(dirpath, name)
+                try:
+                    st = os.stat(path)
+                except OSError:
+                    continue
+                key = f"{st.st_size}:{int(st.st_mtime)}"
+                entry = cache.get(path)
+                if not entry or entry.get("key") != key:
+                    try:
+                        entry = {"key": key, "info": track_info(path, root)}
+                    except OSError:
+                        continue
+                fresh[path] = entry
+                tracks.append(entry["info"])
+                if len(tracks) >= MAX_TRACKS:
+                    break
+            if len(tracks) >= MAX_TRACKS:
+                break
+    if fresh != cache:
+        save_cache(fresh)
+    tracks.sort(key=lambda t: (t["artist"].casefold(), t["title"].casefold()))
+    return {"root": root, "tracks": tracks}
+
+
+
+# ------------------------------------------------------------------- MPD --
+
+class MPDError(Exception):
+    pass
+
+
+def mpd_quote(arg):
+    text = str(arg)
+    if "\n" in text or "\r" in text or "\x00" in text:
+        raise MPDError("argument contains a line break")
+    return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+class MPD:
+    """Minimal MPD protocol client (https://mpd.readthedocs.io/en/latest/protocol.html)."""
+
+    def __init__(self, host=None, port=None, timeout=5.0):
+        self.sock = socket.create_connection((host or MPD_HOST, int(port or MPD_PORT)), timeout=timeout)
+        self.file = self.sock.makefile("rwb")
+        greeting = self.file.readline().decode("utf-8", "replace")
+        if not greeting.startswith("OK MPD"):
+            raise MPDError("not an MPD server")
+
+    def close(self):
+        try:
+            self.file.write(b"close\n")
+            self.file.flush()
+        except OSError:
+            pass
+        self.sock.close()
+
+    def _read(self):
+        pairs = []
+        while True:
+            line = self.file.readline()
+            if not line:
+                raise MPDError("connection closed")
+            line = line.decode("utf-8", "replace").rstrip("\n")
+            if line == "OK" or line == "list_OK":
+                if line == "OK":
+                    return pairs
+                continue
+            if line.startswith("ACK "):
+                raise MPDError(line[4:])
+            key, _, value = line.partition(": ")
+            pairs.append((key, value))
+
+    def command(self, name, *args):
+        self.file.write((" ".join([name] + [mpd_quote(a) for a in args]) + "\n").encode("utf-8"))
+        self.file.flush()
+        return self._read()
+
+    def command_list(self, commands):
+        lines = ["command_list_begin"]
+        lines += [" ".join([c[0]] + [mpd_quote(a) for a in c[1:]]) for c in commands]
+        lines.append("command_list_end")
+        self.file.write(("\n".join(lines) + "\n").encode("utf-8"))
+        self.file.flush()
+        return self._read()
+
+    def status(self):
+        return dict(self.command("status"))
+
+
+def connect():
+    """Connect to MPD, starting its user service once if it isn't running."""
+    try:
+        return MPD()
+    except OSError:
+        subprocess.run(["systemctl", "--user", "start", "mpd.service"], stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, timeout=15, check=False)
+        for _ in range(20):
+            time.sleep(0.25)
+            try:
+                return MPD()
+            except OSError:
+                pass
+    raise MPDError(f"MPD is not running on {MPD_HOST}:{MPD_PORT}")
+
+
+def mpd_music_dir():
+    """MPD's music_directory: $MPD_MUSIC_DIR, else read from ~/.config/mpd/mpd.conf."""
+    if os.environ.get("MPD_MUSIC_DIR"):
+        return os.path.realpath(os.path.expanduser(os.environ["MPD_MUSIC_DIR"]))
+    conf = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "mpd", "mpd.conf")
+    try:
+        with open(conf) as f:
+            for line in f:
+                m = re.match(r'\s*music_directory\s+"([^"]+)"', line)
+                if m:
+                    return os.path.realpath(os.path.expanduser(m.group(1)))
+    except OSError:
+        pass
+    return ""
+
+
+def retire_mpv():
+    """Stop the mpv player earlier versions of this plugin used, so only MPD plays."""
+    sock = os.path.join(RUNTIME_DIR, "specialkapa.spotify-dl-mpv.sock")
+    if not os.path.exists(sock):
+        return
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(1)
+            s.connect(sock)
+            s.sendall(b'{"command": ["quit"]}\n')
+    except OSError:
+        pass
+    try:
+        os.remove(sock)
+    except OSError:
+        pass
+
+
+def wait_for_update(mpd, timeout=20):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if "updating_db" not in mpd.status():
+            return
+        time.sleep(0.3)
+
+
+def play(root, paths, shuffle, start):
+    root = os.path.realpath(root)
+    music = mpd_music_dir() or root
+    clean = []
+    for p in paths[:MAX_PLAY]:
+        real = os.path.realpath(p)
+        if real.startswith(root + os.sep) and real.lower().endswith(".mp3") and os.path.isfile(real):
+            clean.append(real)
+    if not clean:
+        print("nothing to play", file=sys.stderr)
+        return 1
+    uris = []
+    for real in clean:
+        rel = os.path.relpath(real, music)
+        if rel.startswith(".."):
+            print(f"{real} is outside MPD's music_directory ({music})", file=sys.stderr)
+            return 1
+        uris.append(rel)
+    start = start if 0 <= start < len(uris) else 0
+    if shuffle:
+        first = uris.pop(start) if start else None
+        random.shuffle(uris)
+        if first:
+            uris.insert(0, first)
+        start = 0
+    retire_mpv()
+    try:
+        mpd = connect()
+        try:
+            commands = [("clear",), ("random", "0")] + [("add", u) for u in uris] + [("play", str(start))]
+            try:
+                mpd.command_list(commands)
+            except MPDError as e:
+                if "No such" not in str(e) and "Not found" not in str(e):
+                    raise
+                # Fresh downloads MPD hasn't indexed yet: rescan their folders and retry once.
+                for folder in sorted({os.path.dirname(u) or "" for u in uris}):
+                    mpd.command("update", folder) if folder else mpd.command("update")
+                time.sleep(0.3)
+                wait_for_update(mpd)
+                mpd.command_list(commands)
+        finally:
+            mpd.close()
+    except (MPDError, OSError) as e:
+        print(f"MPD: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def player_launcher():
+    path = os.pathsep.join([os.environ.get("PATH", ""),
+                            os.path.join(os.environ.get("OMARCHY_PATH", "/usr/share/omarchy"), "bin")])
+    return shutil.which("omarchy-launch-or-focus-tui", path=path)
+
+
+def ctl(action):
+    if action == "show":
+        # Open rmpc (or focus it if it's open); closing it leaves the music playing.
+        launcher = player_launcher()
+        cmd = [launcher, "rmpc"] if launcher else ["xdg-terminal-exec", f"--app-id={RMPC_APP_ID}", "-e", "rmpc"]
+        subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+        return 0
+    if action == "hide":
+        subprocess.run(["hyprctl", "dispatch", f'hl.dsp.window.close({{ window = "class:^{RMPC_APP_ID}$" }})'],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3, check=False)
+        return 0
+    try:
+        mpd = connect()
+        try:
+            if action == "toggle":
+                state = mpd.status().get("state")
+                if state == "play":
+                    mpd.command("pause", "1")
+                elif state == "pause":
+                    mpd.command("pause", "0")
+                else:
+                    mpd.command("play")
+            elif action == "next":
+                mpd.command("next")
+            elif action == "prev":
+                mpd.command("previous")
+            elif action == "stop":
+                mpd.command("stop")
+        finally:
+            mpd.close()
+    except (MPDError, OSError):
+        return 1
+    return 0
+
+
+def status():
+    try:
+        mpd = MPD(timeout=2)
+        try:
+            st = mpd.status()
+            song = dict(mpd.command("currentsong"))
+        finally:
+            mpd.close()
+    except (MPDError, OSError):
+        return {"playing": False}
+    if st.get("state") not in ("play", "pause"):
+        return {"playing": False}
+    rel = song.get("file", "")
+    music = mpd_music_dir()
+    return {
+        "playing": True,
+        "paused": st.get("state") == "pause",
+        "pos": int(st.get("song", 0) or 0),
+        "count": int(st.get("playlistlength", 0) or 0),
+        "path": os.path.join(music, rel) if music and rel else rel,
+        "title": clip(song.get("Title") or os.path.splitext(os.path.basename(rel))[0]),
+        "artist": clip(song.get("Artist", "")),
+    }
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser()
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    default_root = os.path.expanduser("~/Music/Spotify")
+    p = sub.add_parser("scan")
+    p.add_argument("--root", default=default_root)
+    p = sub.add_parser("play")
+    p.add_argument("--root", default=default_root)
+    p.add_argument("--shuffle", action="store_true")
+    p.add_argument("--start", type=int, default=0)
+    p.add_argument("paths", nargs="+")
+    p = sub.add_parser("ctl")
+    p.add_argument("action", choices=["toggle", "next", "prev", "stop", "show", "hide"])
+    sub.add_parser("status")
+    args = ap.parse_args(argv)
+
+    if args.cmd == "scan":
+        print(json.dumps(scan(os.path.expanduser(args.root)), ensure_ascii=False))
+        return 0
+    if args.cmd == "play":
+        return play(os.path.expanduser(args.root), args.paths, args.shuffle, args.start)
+    if args.cmd == "ctl":
+        return ctl(args.action)
+    print(json.dumps(status(), ensure_ascii=False))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,49 @@
+{
+  "schemaVersion": 1,
+  "id": "specialkapa.spotify-dl",
+  "name": "Spotify Downloader",
+  "version": "0.5.0",
+  "author": "specialkapa",
+  "license": "MIT",
+  "description": "Paste a Spotify or YouTube track, album or playlist link and download it as tagged MP3s with yt-dlp, then browse and play your downloads by genre, artist or playlist. Files are named 'artist - title (feat. artists).mp3' in lowercase. Network access only happens when you start a download.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "SpotifyDl.qml"
+  },
+  "barWidget": {
+    "displayName": "Spotify Downloader",
+    "description": "Download Spotify links as MP3s and play your library filtered by genre, artist or playlist. Click to open, right-click to download the Spotify link on the clipboard.",
+    "category": "Media",
+    "defaultSection": "tray",
+    "allowMultiple": false,
+    "defaults": {
+      "outputDir": "~/Music/Spotify",
+      "notify": true,
+      "fallbackGenre": "Unknown"
+    },
+    "schema": [
+      {
+        "key": "outputDir",
+        "type": "path",
+        "label": "Download folder",
+        "defaultValue": "~/Music/Spotify",
+        "description": "Albums and playlists get their own subfolder here."
+      },
+      {
+        "key": "notify",
+        "type": "boolean",
+        "label": "Notify when a download finishes",
+        "defaultValue": true
+      },
+      {
+        "key": "fallbackGenre",
+        "type": "string",
+        "label": "Fallback genre",
+        "defaultValue": "Unknown",
+        "description": "Written when Deezer has no genre for the track, its album or its artist. Leave empty to write no genre."
+      }
+    ]
+  }
+}

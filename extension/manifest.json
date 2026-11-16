@@ -1,0 +1,29 @@
+{
+  "manifest_version": 3,
+  "name": "Spotify Downloader for Omarchy",
+  "version": "0.2.0",
+  "description": "Send Spotify and YouTube links to the Omarchy Spotify Downloader plugin as tagged MP3s.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA352RKAdONNw1nHAWIy0QSORlvb2h1idvLbQhIWaCIP4Q891y0LcDiAYczF8mw3nDfwtYVvKI+o0UqXGIlBeKTYdfH8/lW8IsLLzv9HDr9nyxD9nfJnYbpDoNkVjqqY4kkpSMTgcdvNyxhiMjfl78wPShf/+judr3HFsFViVolX+4DHC05b9TCdr00x2onuiDIOfYy0VpEFbpmbxhj5JeEEOnZscM276SbX80/ssN8Qi0dJZNjnpE300Sqr+WDr32OXoi/jlarFsutRyn2TiLAMk3dBoDlKWJGo5e/qIlW3YOhDwOeJswfXUdRsUYCkp06e3ntkAD0IxTB2TSVVAm5QIDAQAB",
+  "permissions": [
+    "contextMenus",
+    "nativeMessaging",
+    "activeTab"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "Download with Spotify Downloader",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}

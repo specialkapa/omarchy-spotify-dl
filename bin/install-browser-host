@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# Register (or remove) the Spotify Downloader native messaging host with
+# Chromium-based browsers, so the extension in ../extension can reach it.
+#
+#   bin/install-browser-host                 # Brave
+#   bin/install-browser-host brave-beta chromium
+#   bin/install-browser-host --remove brave
+#
+# Browsers: brave brave-beta brave-nightly brave-origin chromium chrome
+set -euo pipefail
+
+NAME="com.specialkapa.spotify_dl"
+EXTENSION_ID="hoiinglkkfdpckajopjghjcnhfociepc"
+HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+HOST="$HERE/native-host"
+
+dir_for() {
+  case "$1" in
+    brave) echo "$HOME/.config/BraveSoftware/Brave-Browser" ;;
+    brave-beta) echo "$HOME/.config/BraveSoftware/Brave-Browser-Beta" ;;
+    brave-nightly) echo "$HOME/.config/BraveSoftware/Brave-Browser-Nightly" ;;
+    brave-origin) echo "$HOME/.config/BraveSoftware/Brave-Origin" ;;
+    chromium) echo "$HOME/.config/chromium" ;;
+    chrome) echo "$HOME/.config/google-chrome" ;;
+    *) echo "unknown browser: $1" >&2; exit 1 ;;
+  esac
+}
+
+remove=0
+if [[ ${1:-} == "--remove" ]]; then remove=1; shift; fi
+(( $# )) || set -- brave
+
+chmod +x "$HOST"
+for browser in "$@"; do
+  target="$(dir_for "$browser")/NativeMessagingHosts/$NAME.json"
+  if (( remove )); then
+    rm -f "$target" && echo "removed $target"
+    continue
+  fi
+  mkdir -p "$(dirname "$target")"
+  jq -n --arg name "$NAME" --arg path "$HOST" --arg origin "chrome-extension://$EXTENSION_ID/" '{
+    name: $name,
+    description: "Omarchy Spotify Downloader host",
+    path: $path,
+    type: "stdio",
+    allowed_origins: [$origin]
+  }' >"$target"
+  echo "registered $target"
+done

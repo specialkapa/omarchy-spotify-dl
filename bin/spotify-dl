@@ -1,0 +1,967 @@
+#!/usr/bin/env python3
+"""Download a Spotify or YouTube track, album or playlist as tagged MP3s via yt-dlp.
+
+YouTube links (videos, youtu.be, music.youtube.com, /playlist?list=) are
+downloaded directly; artist and title come from yt-dlp's metadata or the
+video title ("Artist - Title (Official Video)" is cleaned up).
+
+Spotify audio itself is DRM-protected, so this reads the public track list
+from Spotify's embed page (open.spotify.com/embed/...), then has yt-dlp find
+the best-matching YouTube upload for each track (closest duration among the
+top search results), extracts it to MP3 and tags it with ffmpeg.
+
+Files are named:  artist - title (feat. other artists).mp3   (all lowercase)
+Albums and playlists go in a lowercase subfolder named after them.
+Tags: title, artist, album artist, genre (from Deezer's public catalogue,
+with fallbacks; see Genres), grouping (the playlist/album name), source
+(track/album/playlist), album and track number for albums.
+
+Usage:  spotify-dl [--json] [--out DIR] [--fallback-genre G] <spotify-url-or-uri>
+        spotify-dl --fill-genres DIR [--fallback-genre G]
+        spotify-dl --fill-covers DIR
+
+With --json, progress is printed as one JSON object per line (consumed by the
+Omarchy shell plugin); otherwise as human-readable text.
+"""
+
+import argparse
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import unicodedata
+import urllib.parse
+import urllib.request
+
+EMBED_HOST = "https://open.spotify.com/embed"
+DEEZER_API = "https://api.deezer.com"
+MAX_API_BYTES = 1024 * 1024
+MAX_PAGE_BYTES = 8 * 1024 * 1024
+MAX_TRACKS = 500
+MAX_FIELD = 300
+HTTP_TIMEOUT = 20
+SEARCH_RESULTS = 5
+# Uploads with these words are usually not the studio recording; penalised
+# unless the Spotify title itself contains the word.
+SUSPECT_WORDS = ("live", "cover", "remix", "karaoke", "instrumental", "sped up",
+                 "slowed", "reverb", "8d", "nightcore", "reaction", "lyrics video")
+
+URL_RE = re.compile(
+    r"^(?:https?://)?open\.spotify\.com/(?:intl-[a-z]{2}(?:-[a-z]{2})?/)?(?:embed/)?"
+    r"(track|album|playlist)/([A-Za-z0-9]{22})(?:[/?#].*)?$",
+    re.IGNORECASE,
+)
+URI_RE = re.compile(r"^spotify:(track|album|playlist):([A-Za-z0-9]{22})$", re.IGNORECASE)
+YT_VIDEO_RE = re.compile(
+    r"^(?:https?://)?(?:(?:www|m|music)\.)?(?:youtube\.com/(?:watch\?(?:[^#\s]*&)?v=|shorts/|live/)|youtu\.be/)"
+    r"([A-Za-z0-9_-]{11})(?:[?&#/][^\s]*)?$",
+    re.IGNORECASE,
+)
+YT_BROWSE_RE = re.compile(r"^(?:https?://)?music\.youtube\.com/browse/(MPREb_[A-Za-z0-9_-]{6,40})(?:[?#][^\s]*)?$",
+                          re.IGNORECASE)
+YT_LIST_RE = re.compile(
+    r"^(?:https?://)?(?:(?:www|m|music)\.)?youtube\.com/playlist\?(?:[^#\s]*&)?list=([A-Za-z0-9_-]{10,64})(?:[&#][^\s]*)?$",
+    re.IGNORECASE,
+)
+# Bracketed clutter in YouTube titles: "(Official Video)", "[4K Remaster]", "(Lyrics)".
+YT_JUNK_RE = re.compile(
+    r"\s*[\(\[][^\)\]]*\b(?:official|video|audio|lyrics?|visuali[sz]er|hd|hq|4k|8k|mv|m/v|clip|"
+    r"remaster(?:ed)?|explicit|color coded|live session|full album)\b[^\)\]]*[\)\]]",
+    re.IGNORECASE,
+)
+YT_TRAILING_JUNK_RE = re.compile(r"\s*[-–—|]?\s*\b(?:official\s+(?:music\s+)?(?:video|audio)|lyrics?|hd|hq|4k)\s*$",
+                                 re.IGNORECASE)
+YT_BARE_FEAT_RE = re.compile(r"\s+(?:feat\.?|ft\.?|featuring)\s+(.+)$", re.IGNORECASE)
+YT_SPLIT_RE = re.compile(r"\s+[-–—]\s+")
+NEXT_DATA_RE = re.compile(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', re.S)
+FEAT_PAREN_RE = re.compile(r"\s*[\(\[](?:feat\.?|ft\.?|featuring|with)\s+([^\)\]]+)[\)\]]", re.IGNORECASE)
+ILLEGAL_RE = re.compile(r'[/\\:*?"<>|\x00-\x1f\x7f]')
+
+
+class Cancelled(Exception):
+    pass
+
+
+# ---------------------------------------------------------------- helpers --
+
+def clip(value, limit=MAX_FIELD):
+    s = str(value if value is not None else "")
+    s = unicodedata.normalize("NFC", s).replace("\xa0", " ")
+    s = re.sub(r"[\x00-\x1f\x7f]", "", s)
+    return s.strip()[:limit]
+
+
+def parse_link(text):
+    """Return (provider, kind, id) for a supported link, or raise ValueError.
+
+    provider: "spotify" | "youtube"; kind: "track" | "album" | "playlist".
+    YouTube watch links are always one video, even with &list= (that is
+    usually an endless auto-generated mix); whole playlists need a
+    /playlist?list= link. YouTube Music album playlists (OLAK5uy_...) count
+    as albums.
+    """
+    s = (text or "").strip()
+    m = URL_RE.match(s) or URI_RE.match(s)
+    if m:
+        return "spotify", m.group(1).lower(), m.group(2)
+    m = YT_VIDEO_RE.match(s)
+    if m:
+        return "youtube", "track", m.group(1)
+    m = YT_BROWSE_RE.match(s)  # YouTube Music album page
+    if m:
+        return "youtube", "album", m.group(1)
+    m = YT_LIST_RE.match(s)
+    if m:
+        list_id = m.group(1)
+        if list_id.startswith("RD"):
+            raise ValueError("YouTube mixes are endless; open the video or a real playlist instead")
+        return "youtube", "album" if list_id.startswith("OLAK5uy_") else "playlist", list_id
+    raise ValueError("not a Spotify or YouTube track, album or playlist link")
+
+
+def youtube_url(kind, ident):
+    if kind == "track":
+        return f"https://www.youtube.com/watch?v={ident}"
+    if ident.startswith("MPREb_"):
+        return f"https://music.youtube.com/browse/{ident}"
+    return f"https://www.youtube.com/playlist?list={ident}"
+
+
+def sanitize_component(name, limit=180):
+    s = ILLEGAL_RE.sub(" ", name)
+    s = re.sub(r"\s+", " ", s).strip().strip(".").strip()
+    # Keep under common 255-byte filename limits, leaving room for ".mp3".
+    b = s.encode("utf-8")[:limit]
+    s = b.decode("utf-8", "ignore").strip()
+    return s or "untitled"
+
+
+def _norm(s):
+    return re.sub(r"\s+", " ", s.casefold()).strip()
+
+
+def file_stem(artists, title):
+    """artist - title (feat. a, b), lowercased and filesystem-safe."""
+    primary, display_title = standard_names(artists, title)
+    return sanitize_component(f"{primary} - {display_title}".lower())
+
+
+def standard_names(artists, title):
+    """Return (primary artist, "title (feat. a, b)") in their original case.
+
+    Existing "(feat. x)", "(ft. x)" or "(with x)" groups in the title are
+    rewritten into a single standard "(feat. ...)" suffix; featured artists
+    already named elsewhere in the title (e.g. "Song + Zara Larsson") are
+    not repeated.
+    """
+    artists = [a for a in (clip(a) for a in artists) if a] or ["unknown artist"]
+    title = clip(title) or "untitled"
+    primary, others = artists[0], artists[1:]
+
+    featured = []
+    for m in FEAT_PAREN_RE.finditer(title):
+        for name in re.split(r",\s*|\s+&\s+|\s+and\s+", m.group(1)):
+            name = name.strip()
+            if name:
+                featured.append(name)
+    base = FEAT_PAREN_RE.sub("", title).strip() or title
+
+    for a in others:
+        if _norm(a) in _norm(base):
+            continue
+        if not any(_norm(a) == _norm(f) for f in featured):
+            featured.append(a)
+    featured = [f for f in featured if _norm(f) != _norm(primary)]
+
+    if featured:
+        base += f" (feat. {', '.join(featured)})"
+    return primary, base
+
+
+# --------------------------------------------------------------- metadata --
+
+def fetch_entity(kind, sid):
+    url = f"{EMBED_HOST}/{kind}/{sid}"
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) Gecko/20100101 Firefox/140.0",
+        "Accept-Language": "en",
+    })
+    with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+        body = resp.read(MAX_PAGE_BYTES + 1)
+    if len(body) > MAX_PAGE_BYTES:
+        raise RuntimeError("Spotify page too large")
+    m = NEXT_DATA_RE.search(body.decode("utf-8", "replace"))
+    if not m:
+        raise RuntimeError("could not read Spotify page (layout changed?)")
+    data = json.loads(m.group(1))
+    try:
+        return data["props"]["pageProps"]["state"]["data"]["entity"]
+    except (KeyError, TypeError):
+        raise RuntimeError("Spotify link not found or not public")
+
+
+def tracks_from_entity(kind, entity):
+    """Return (collection_name or None, [ {title, artists, duration, album} ])."""
+    if not isinstance(entity, dict):
+        raise RuntimeError("unexpected Spotify response")
+    name = clip(entity.get("name") or entity.get("title"))
+    if kind == "track":
+        artists = [clip(a.get("name")) for a in entity.get("artists") or [] if isinstance(a, dict)]
+        return None, [{
+            "title": name,
+            "artists": artists[:20],
+            "duration": int(entity.get("duration") or 0) // 1000,
+            "album": "",
+        }]
+    out = []
+    for t in (entity.get("trackList") or [])[:MAX_TRACKS]:
+        if not isinstance(t, dict):
+            continue
+        title = clip(t.get("title"))
+        if not title:
+            continue
+        artists = [clip(a) for a in str(t.get("subtitle") or "").replace(",\xa0", "\x1f").split("\x1f")]
+        out.append({
+            "title": title,
+            "artists": [a for a in artists if a][:20],
+            "duration": int(t.get("duration") or 0) // 1000,
+            "album": name if kind == "album" else "",
+            "album_artist": clip(entity.get("subtitle")) if kind == "album" else "",
+        })
+    if not out:
+        raise RuntimeError("no tracks found")
+    return name, out
+
+
+# ---------------------------------------------------------------- youtube --
+
+def _split_names(text):
+    return [n.strip() for n in re.split(r",\s*|\s+&\s+|\s+and\s+|\s+x\s+", text) if n.strip()]
+
+
+def clean_youtube_title(title):
+    t = clip(title)
+    t = t.split(" | ")[0]
+    for _ in range(3):
+        t = YT_JUNK_RE.sub("", t)
+        t = YT_TRAILING_JUNK_RE.sub("", t)
+    return re.sub(r"\s+", " ", t).strip(" -–—|\"'") or clip(title)
+
+
+def clean_channel(name):
+    n = clip(name)
+    n = re.sub(r"\s*-\s*Topic$", "", n, flags=re.IGNORECASE)
+    n = re.sub(r"(?:VEVO|\s+Official)$", "", n, flags=re.IGNORECASE).strip()
+    return n
+
+
+def youtube_names(info):
+    """Return (artists, title) for a YouTube video's info dict.
+
+    Uses yt-dlp's artist/track fields when present (YouTube Music, official
+    artist channels), otherwise splits "Artist - Title (Official Video)
+    ft. Someone" and falls back to the channel name as the artist.
+    """
+    track = clip(info.get("track"))
+    artists = info.get("artists") if isinstance(info.get("artists"), list) else []
+    artists = [clip(a) for a in artists if clip(a)]
+    if not artists and clip(info.get("artist")):
+        artists = [a.strip() for a in clip(info.get("artist")).split(",") if a.strip()]
+    if track and artists:
+        title = track
+    else:
+        title = clean_youtube_title(info.get("title"))
+        parts = YT_SPLIT_RE.split(title, maxsplit=1)
+        if len(parts) == 2 and parts[0] and parts[1]:
+            artists, title = _split_names(parts[0])[:1] + _split_names(parts[0])[1:], parts[1]
+        else:
+            artists = [clean_channel(info.get("channel") or info.get("uploader")) or "Unknown artist"]
+    # "Artist feat. Other" in the artist field
+    expanded = []
+    for a in artists:
+        bits = re.split(r"\s+(?:feat\.?|ft\.?|featuring)\s+", a, flags=re.IGNORECASE)
+        expanded.append(bits[0].strip())
+        for b in bits[1:]:
+            expanded += _split_names(b)
+    # "Title ft. A, B" without brackets
+    m = YT_BARE_FEAT_RE.search(title)
+    if m and "(" not in m.group(1) and "[" not in m.group(1):
+        expanded += _split_names(m.group(1))
+        title = title[:m.start()].strip()
+    seen, out = set(), []
+    for a in expanded:
+        if a and _norm(a) not in seen:
+            seen.add(_norm(a))
+            out.append(a)
+    return out[:20] or ["Unknown artist"], clean_youtube_title(title)
+
+
+def youtube_collection(runner, kind, ident):
+    """Return (name, [track stubs], total_available) for a YouTube playlist/album."""
+    raw = runner.run(["yt-dlp", "--no-warnings", "--ignore-config", "--flat-playlist", "-J",
+                      "--playlist-end", str(MAX_TRACKS), youtube_url(kind, ident)], timeout=120)
+    data = json.loads(raw)
+    name = clip(data.get("title")) or "youtube playlist"
+    if kind == "album":
+        name = re.sub(r"^Album\s*[-–]\s*", "", name)
+    tracks = []
+    for e in (data.get("entries") or [])[:MAX_TRACKS]:
+        vid = str((e or {}).get("id") or "")
+        if not re.fullmatch(r"[A-Za-z0-9_-]{11}", vid):
+            continue
+        tracks.append({"video": vid, "title": clip(e.get("title")), "artists": [], "duration": int(e.get("duration") or 0),
+                       "album": name if kind == "album" else ""})
+    if not tracks:
+        raise RuntimeError("playlist is empty or private")
+    total = data.get("playlist_count") if isinstance(data.get("playlist_count"), int) else len(tracks)
+    return name, tracks, total
+
+
+def resolve_youtube(runner, track, workdir):
+    """Fetch full metadata for a YouTube track stub; keeps the info JSON for download."""
+    raw = runner.run(["yt-dlp", "--no-warnings", "--ignore-config", "--no-playlist", "-j", "--skip-download",
+                      youtube_url("track", track["video"])], timeout=90)
+    info = json.loads(raw)
+    path = os.path.join(workdir, "info.json")
+    with open(path, "w") as f:
+        f.write(raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw)
+    track["artists"], track["title"] = youtube_names(info)
+    track["duration"] = int(info.get("duration") or 0)
+    track["info_json"] = path
+    track["url"] = youtube_url("track", track["video"])
+
+
+# ------------------------------------------------------------------ genre --
+
+class Genres:
+    """Look up genres from Deezer's public catalogue (no account needed).
+
+    Spotify's embed page has no genre and its Web API needs credentials.
+    Deezer's genres are broad ("Pop", "Rap/Hip Hop", "Dance"), which is what
+    you want for picking music by genre. Matches are only accepted when the
+    artist agrees with Spotify's. Fallback order for a track:
+
+      1. the genre of the Deezer album the track is on
+      2. for album downloads, the genre of that album (looked up once)
+      3. the artist's most common genre across their Deezer albums
+      4. the --fallback-genre value (may be empty: no genre written)
+    """
+
+    def __init__(self):
+        self.album_cache = {}
+        self.artist_cache = {}
+        self.genre_names = None
+
+    def _get(self, path, params=None):
+        url = f"{DEEZER_API}/{path}"
+        if params:
+            url += "?" + urllib.parse.urlencode(params)
+        req = urllib.request.Request(url, headers={"User-Agent": "spotify-dl-omarchy-plugin"})
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+            body = resp.read(MAX_API_BYTES + 1)
+        if len(body) > MAX_API_BYTES:
+            raise RuntimeError("response too large")
+        data = json.loads(body)
+        return data if isinstance(data, dict) else {}
+
+    @staticmethod
+    def _same_artist(a, b):
+        a, b = _norm(a), _norm(b)
+        return bool(a and b and (a in b or b in a))
+
+    def _album_genre(self, album_id):
+        if not isinstance(album_id, int):
+            return ""
+        if album_id not in self.album_cache:
+            album = self._get(f"album/{album_id}")
+            names = [clip(g.get("name"), 60) for g in ((album.get("genres") or {}).get("data") or [])
+                     if isinstance(g, dict)]
+            self.album_cache[album_id] = next((n for n in names if n), "")
+        return self.album_cache[album_id]
+
+    def from_track(self, artist, title):
+        found = self._get("search", {"q": f"{artist} {title}", "limit": 5})
+        for hit in (found.get("data") or [])[:5]:
+            if self._same_artist((hit.get("artist") or {}).get("name"), artist):
+                return self._album_genre((hit.get("album") or {}).get("id"))
+        return ""
+
+    def from_album(self, artist, album):
+        found = self._get("search/album", {"q": f"{artist} {album}", "limit": 5})
+        for hit in (found.get("data") or [])[:5]:
+            if self._same_artist((hit.get("artist") or {}).get("name"), artist):
+                genre = self._album_genre(hit.get("id"))
+                if genre:
+                    return genre
+        return ""
+
+    def from_artist(self, artist):
+        key = _norm(artist)
+        if key in self.artist_cache:
+            return self.artist_cache[key]
+        genre = ""
+        found = self._get("search/artist", {"q": artist, "limit": 5})
+        for hit in (found.get("data") or [])[:5]:
+            if not isinstance(hit.get("id"), int) or not self._same_artist(hit.get("name"), artist):
+                continue
+            albums = self._get(f"artist/{hit['id']}/albums", {"limit": 100}).get("data") or []
+            counts = {}
+            for a in albums:
+                gid = a.get("genre_id") if isinstance(a, dict) else None
+                if isinstance(gid, int) and gid > 0:
+                    counts[gid] = counts.get(gid, 0) + 1
+            if counts:
+                if self.genre_names is None:
+                    self.genre_names = {g.get("id"): clip(g.get("name"), 60)
+                                        for g in self._get("genre").get("data") or [] if isinstance(g, dict)}
+                genre = self.genre_names.get(max(counts, key=counts.get), "")
+            break
+        self.artist_cache[key] = genre
+        return genre
+
+    def lookup(self, artists, title, album_genre="", fallback=""):
+        """Return the best genre for a track; never raises."""
+        steps = []
+        if artists:
+            steps.append(lambda: self.from_track(artists[0], title))
+        steps.append(lambda: album_genre)
+        steps.extend((lambda a=a: self.from_artist(a)) for a in artists[:3])
+        for step in steps:
+            try:
+                genre = step()
+            except Exception:  # noqa: BLE001 - genre is best-effort
+                genre = ""
+            if genre:
+                return genre
+        return clip(fallback, 60)
+
+
+# ----------------------------------------------------------------- covers --
+
+COVER_HOSTS = re.compile(r"^https://(?:image-cdn-[a-z0-9-]+\.spotifycdn\.com|i\.scdn\.co|"
+                         r"(?:cdn-images|e-cdns-images|cdns-images)\.dzcdn\.net|i\.ytimg\.com)/")
+MAX_COVER_BYTES = 8 * 1024 * 1024
+
+
+class Covers:
+    """Find and prepare album covers (saved as square-ish JPEGs, max 1000px).
+
+    Sources, best first: the Spotify embed's own image (track and album
+    links), the Deezer album cover of the matching track or album, and the
+    YouTube video thumbnail (center-cropped to a square).
+    """
+
+    def __init__(self, genres, workdir, runner):
+        self.genres = genres
+        self.workdir = workdir
+        self.runner = runner
+        self.album_covers = {}
+
+    @staticmethod
+    def spotify_image(entity):
+        images = ((entity or {}).get("visualIdentity") or {}).get("image") or []
+        best = max((i for i in images if isinstance(i, dict) and isinstance(i.get("url"), str)),
+                   key=lambda i: i.get("maxWidth") or 0, default=None)
+        return best["url"] if best else ""
+
+    def deezer_track(self, artist, title):
+        found = self.genres._get("search", {"q": f"{artist} {title}", "limit": 5})
+        for hit in (found.get("data") or [])[:5]:
+            if self.genres._same_artist((hit.get("artist") or {}).get("name"), artist):
+                return str((hit.get("album") or {}).get("cover_xl") or "")
+        return ""
+
+    def deezer_album(self, artist, album):
+        key = (_norm(artist), _norm(album))
+        if key not in self.album_covers:
+            url = ""
+            found = self.genres._get("search/album", {"q": f"{artist} {album}", "limit": 5})
+            for hit in (found.get("data") or [])[:5]:
+                if self.genres._same_artist((hit.get("artist") or {}).get("name"), artist):
+                    url = str(hit.get("cover_xl") or "")
+                    break
+            self.album_covers[key] = url
+        return self.album_covers[key]
+
+    def _download(self, url):
+        if not COVER_HOSTS.match(url or ""):
+            return b""
+        req = urllib.request.Request(url, headers={"User-Agent": "spotify-dl-omarchy-plugin"})
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+            data = resp.read(MAX_COVER_BYTES + 1)
+        if len(data) > MAX_COVER_BYTES:
+            return b""
+        if not (data[:3] == b"\xff\xd8\xff" or data[:8] == b"\x89PNG\r\n\x1a\n" or data[8:12] == b"WEBP"):
+            return b""
+        return data
+
+    def prepare(self, url, square_crop=False, name="cover"):
+        """Download an image and convert it to a JPEG for embedding; returns a path or ""."""
+        data = self._download(url)
+        if not data:
+            return ""
+        raw = os.path.join(self.workdir, f"{name}.src")
+        out = os.path.join(self.workdir, f"{name}.jpg")
+        with open(raw, "wb") as f:
+            f.write(data)
+        vf = "crop='min(iw,ih)':'min(iw,ih)'," if square_crop else ""
+        vf += "scale='min(1000,iw)':-2"
+        self.runner.run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", raw,
+                         "-frames:v", "1", "-vf", vf, "-q:v", "3", out], timeout=60)
+        os.remove(raw)
+        return out if os.path.exists(out) and os.path.getsize(out) > 0 else ""
+
+    def youtube_thumbnail(self, video_id, name="cover"):
+        if not re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id or ""):
+            return ""
+        for size in ("maxresdefault", "hqdefault"):
+            try:
+                path = self.prepare(f"https://i.ytimg.com/vi/{video_id}/{size}.jpg", square_crop=True, name=name)
+            except Exception:  # noqa: BLE001
+                path = ""
+            if path:
+                return path
+        return ""
+
+    def find(self, artists, title, album="", album_artist="", direct_url="", video_id="", name="cover"):
+        """Best-effort cover for a track; never raises. Returns a JPEG path or ""."""
+        steps = []
+        if direct_url:
+            steps.append(lambda: self.prepare(direct_url, name=name))
+        if album and (album_artist or artists):
+            steps.append(lambda: self.prepare(self.deezer_album(album_artist or artists[0], album), name=name))
+        if artists:
+            steps.append(lambda: self.prepare(self.deezer_track(artists[0], title), name=name))
+        if video_id:
+            steps.append(lambda: self.youtube_thumbnail(video_id, name=name))
+        for step in steps:
+            try:
+                path = step()
+            except Cancelled:
+                raise
+            except Exception:  # noqa: BLE001 - covers are best-effort
+                path = ""
+            if path:
+                return path
+        return ""
+
+
+def embed_cover(runner, src, cover, out):
+    """Copy src to out with cover attached as the front-cover picture (audio untouched)."""
+    runner.run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", src, "-i", cover,
+                "-map", "0:a", "-map", "1:v", "-c", "copy", "-id3v2_version", "3",
+                "-metadata:s:v", "title=Album cover", "-metadata:s:v", "comment=Cover (front)",
+                "-disposition:v:0", "attached_pic", out], timeout=120)
+
+
+def has_cover(path):
+    out = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v", "-show_entries", "stream=index",
+                          "-of", "csv=p=0", path], capture_output=True, text=True, timeout=30)
+    return out.returncode == 0 and out.stdout.strip() != ""
+
+
+def youtube_id_from(text):
+    m = re.search(r"(?:youtube\.com/watch\?(?:[^#\s]*&)?v=|youtu\.be/)([A-Za-z0-9_-]{11})", text or "")
+    return m.group(1) if m else ""
+
+
+def fill_covers(root, rep):
+    """Embed album covers into existing MP3s under root that have none."""
+    runner = Runner()
+    root = os.path.abspath(os.path.expanduser(root))
+    files = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(d for d in dirnames if not d.startswith("."))
+        files += [os.path.join(dirpath, f) for f in sorted(filenames)
+                  if f.lower().endswith(".mp3") and not f.startswith(".")]
+    workdir = tempfile.mkdtemp(prefix=".spotify-dl-covers-", dir=root)
+    covers = Covers(Genres(), workdir, runner)
+    filled = skipped = failed = 0
+    try:
+        for path in files[:MAX_TRACKS * 10]:
+            name = os.path.splitext(os.path.basename(path))[0]
+            try:
+                if has_cover(path):
+                    skipped += 1
+                    continue
+                out = subprocess.run(["ffprobe", "-v", "error", "-of", "json", "-show_entries", "format_tags", path],
+                                     capture_output=True, timeout=30, check=True).stdout
+                tags = {k.lower(): v for k, v in (json.loads(out).get("format", {}).get("tags") or {}).items()}
+                artists = [clip(a) for a in (tags.get("artists") or tags.get("artist") or "").split(";") if a.strip()]
+                title = FEAT_PAREN_RE.sub("", clip(tags.get("title"))).strip()
+                album = clip(tags.get("album")) if clip(tags.get("source")) in ("album", "") else ""
+                cover = covers.find(artists, title, album=album, album_artist=clip(tags.get("album_artist")),
+                                    video_id=youtube_id_from(tags.get("comment")))
+                if not cover:
+                    failed += 1
+                    rep.emit("retag", name=name, status="failed", error="no cover found")
+                    continue
+                tmp = os.path.join(workdir, "out.mp3")
+                runner.run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", path, "-i", cover,
+                            "-map", "0:a", "-map", "1:v", "-c", "copy", "-map_metadata", "0", "-id3v2_version", "3",
+                            "-metadata:s:v", "title=Album cover", "-metadata:s:v", "comment=Cover (front)",
+                            "-disposition:v:0", "attached_pic", tmp], timeout=120)
+                os.replace(tmp, path)
+                os.remove(cover)
+                filled += 1
+                rep.emit("retag", name=name, status="done", genre="cover")
+            except Cancelled:
+                raise
+            except Exception as e:  # noqa: BLE001
+                failed += 1
+                rep.emit("retag", name=name, status="failed", error=clip(str(e), 200))
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+    rep.emit("filled", filled=filled, skipped=skipped, failed=failed, what="cover")
+    return 0
+
+
+def fill_genres(root, fallback, rep):
+    """Add a genre to MP3s under root that have none, using their tags."""
+    genres = Genres()
+    files = []
+    for dirpath, dirnames, filenames in os.walk(os.path.abspath(os.path.expanduser(root))):
+        dirnames[:] = sorted(d for d in dirnames if not d.startswith("."))
+        files += [os.path.join(dirpath, f) for f in sorted(filenames)
+                  if f.lower().endswith(".mp3") and not f.startswith(".")]
+    filled = skipped = failed = 0
+    for path in files[:MAX_TRACKS * 10]:
+        try:
+            out = subprocess.run(["ffprobe", "-v", "error", "-of", "json", "-show_entries", "format_tags", path],
+                                 capture_output=True, timeout=30, check=True).stdout
+            tags = {k.lower(): v for k, v in (json.loads(out).get("format", {}).get("tags") or {}).items()}
+        except Exception:  # noqa: BLE001
+            failed += 1
+            continue
+        if clip(tags.get("genre")):
+            skipped += 1
+            continue
+        artists = [clip(a) for a in (tags.get("artists") or tags.get("artist") or "").split(";") if a.strip()]
+        title = FEAT_PAREN_RE.sub("", clip(tags.get("title"))).strip()
+        album_genre = ""
+        if artists and tags.get("album"):
+            try:
+                album_genre = genres.from_album(artists[0], clip(tags.get("album")))
+            except Exception:  # noqa: BLE001
+                pass
+        genre = genres.lookup(artists, title, album_genre, fallback)
+        name = os.path.splitext(os.path.basename(path))[0]
+        if not genre:
+            failed += 1
+            rep.emit("retag", name=name, status="failed", error="no genre found")
+            continue
+        tmp = os.path.join(os.path.dirname(path), f".{name}.genre.mp3")
+        try:
+            subprocess.run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", path,
+                            "-map", "0", "-c", "copy", "-id3v2_version", "3", "-metadata", f"genre={genre}", tmp],
+                           capture_output=True, timeout=120, check=True)
+            os.replace(tmp, path)
+            filled += 1
+            rep.emit("retag", name=name, status="done", genre=genre)
+        except Exception as e:  # noqa: BLE001
+            failed += 1
+            if os.path.exists(tmp):
+                os.remove(tmp)
+            rep.emit("retag", name=name, status="failed", error=clip(str(e), 200))
+    rep.emit("filled", filled=filled, skipped=skipped, failed=failed)
+    return 0
+
+
+# ---------------------------------------------------------------- yt-dlp --
+
+class Runner:
+    def __init__(self):
+        self.child = None
+        self.cancelled = False
+
+    def run(self, cmd, timeout):
+        if self.cancelled:
+            raise Cancelled()
+        self.child = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                      stderr=subprocess.PIPE, start_new_session=True)
+        try:
+            out, err = self.child.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            self.kill()
+            self.child.communicate()
+            raise RuntimeError("timed out")
+        finally:
+            code = self.child.returncode
+            self.child = None
+        if self.cancelled:
+            raise Cancelled()
+        if code != 0:
+            lines = [l for l in err.decode("utf-8", "replace").splitlines() if l.strip()]
+            raise RuntimeError(clip(lines[-1] if lines else f"exit {code}", 200))
+        return out
+
+    def kill(self):
+        if self.child and self.child.poll() is None:
+            try:
+                os.killpg(self.child.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+
+
+def pick_video(runner, track):
+    query = f"{', '.join(track['artists'])} - {track['title']}"
+    raw = runner.run(["yt-dlp", "--no-warnings", "--ignore-config", "--flat-playlist", "-J",
+                      f"ytsearch{SEARCH_RESULTS}:{query}"], timeout=60)
+    entries = (json.loads(raw).get("entries") or [])[:SEARCH_RESULTS]
+    want = track["duration"]
+    lower_title = track["title"].casefold()
+    best, best_score = None, None
+    for rank, e in enumerate(entries):
+        vid = str(e.get("id") or "")
+        if not re.fullmatch(r"[A-Za-z0-9_-]{11}", vid):
+            continue
+        dur = e.get("duration") or 0
+        score = abs(dur - want) if want and dur else 30
+        name = str(e.get("title") or "").casefold()
+        score += sum(25 for w in SUSPECT_WORDS if w in name and w not in lower_title)
+        score += rank * 2  # tie-break towards YouTube's own ranking
+        if best_score is None or score < best_score:
+            best, best_score = vid, score
+    if not best:
+        raise RuntimeError("no YouTube match")
+    return f"https://www.youtube.com/watch?v={best}"
+
+
+def download_track(runner, track, target, workdir, covers=None):
+    if track.get("info_json"):
+        url = track["url"]
+        source_args = ["--load-info-json", track["info_json"]]
+    else:
+        url = pick_video(runner, track)
+        source_args = [url]
+    if covers and not track.get("cover"):
+        track["cover"] = covers.youtube_thumbnail(youtube_id_from(url))
+    runner.run(["yt-dlp", "--no-warnings", "--ignore-config", "--no-playlist", "--no-progress",
+                "-q", "-f", "bestaudio/best", "-x", "--audio-format", "mp3", "--audio-quality", "0",
+                "-o", os.path.join(workdir, "dl.%(ext)s")] + source_args, timeout=600)
+    src = os.path.join(workdir, "dl.mp3")
+    if not os.path.exists(src):
+        raise RuntimeError("yt-dlp produced no mp3")
+    tagged = os.path.join(workdir, "tagged.mp3")
+    primary, display_title = standard_names(track["artists"], track["title"])
+    cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", src,
+           "-map", "0:a", "-c", "copy", "-map_metadata", "-1", "-id3v2_version", "3",
+           # One clean artist per track so players can filter by artist;
+           # featured artists go in the title, as in the file name, and the
+           # full list is kept in ARTISTS (the MusicBrainz Picard convention).
+           "-metadata", f"title={display_title}",
+           "-metadata", f"artist={primary}",
+           "-metadata", f"album_artist={track.get('album_artist') or primary}",
+           "-metadata", f"artists={'; '.join(track['artists'])}",
+           "-metadata", f"comment={url}"]
+    if track.get("album"):
+        cmd += ["-metadata", f"album={track['album']}"]
+    if track.get("genre"):
+        cmd += ["-metadata", f"genre={track['genre']}"]
+    if track.get("grouping"):
+        cmd += ["-metadata", f"grouping={track['grouping']}"]
+    if track.get("source"):
+        cmd += ["-metadata", f"source={track['source']}"]
+    if track.get("origin"):
+        cmd += ["-metadata", f"origin={track['origin']}"]
+    if track.get("number"):
+        cmd += ["-metadata", f"track={track['number']}"]
+    runner.run(cmd + [tagged], timeout=120)
+    if track.get("cover") and os.path.exists(track["cover"]):
+        with_cover = os.path.join(workdir, "covered.mp3")
+        try:
+            embed_cover(runner, tagged, track["cover"], with_cover)
+            os.replace(with_cover, tagged)
+        except Cancelled:
+            raise
+        except Exception:  # noqa: BLE001 - keep the track without a cover
+            pass
+        os.remove(track["cover"])
+    os.replace(tagged, target)
+    os.remove(src)
+
+
+# ------------------------------------------------------------------ main --
+
+class Reporter:
+    def __init__(self, as_json):
+        self.as_json = as_json
+
+    def emit(self, event, **fields):
+        if self.as_json:
+            try:
+                print(json.dumps({"event": event, **fields}, ensure_ascii=False), flush=True)
+            except BrokenPipeError:  # reader went away (plugin reloaded); keep working quietly
+                sys.stdout = open(os.devnull, "w")
+            return
+        if event == "start":
+            print(f"{fields['kind']}: {fields['name']} ({fields['total']} tracks) -> {fields['dir']}")
+            if fields.get("truncated"):
+                print(f"note: only the first {fields['limit']} tracks of this playlist are available")
+        elif event == "track" and fields["status"] in ("done", "skipped", "failed"):
+            extra = f"  ({fields['error']})" if fields.get("error") else ""
+            extra += f"  [{fields['genre']}]" if fields.get("genre") else ""
+            print(f"[{fields['index']}/{fields['total']}] {fields['status']:7} {fields['name']}{extra}")
+        elif event == "retag":
+            extra = f"  [{fields['genre']}]" if fields.get("genre") else f"  ({fields.get('error', '')})"
+            print(f"{fields['status']:7} {fields['name']}{extra}")
+        elif event == "filled":
+            what = fields.get("what", "genre")
+            print(f"done: {fields['filled']} tagged, {fields['skipped']} already had a {what}, "
+                  f"{fields['failed']} without a match")
+        elif event == "finish":
+            print(f"done: {fields['done']} downloaded, {fields['skipped']} already present, "
+                  f"{fields['failed']} failed")
+        elif event == "error":
+            print(f"error: {fields['message']}", file=sys.stderr)
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("link", nargs="?")
+    ap.add_argument("--fallback-genre", default="",
+                    help="genre to write when none can be found (default: leave empty)")
+    ap.add_argument("--fill-covers", metavar="DIR",
+                    help="embed album covers into existing MP3s under DIR that have none, then exit")
+    ap.add_argument("--fill-genres", metavar="DIR",
+                    help="add a genre to existing MP3s under DIR that have none, then exit")
+    ap.add_argument("--out", default=os.path.expanduser("~/Music/Spotify"))
+    ap.add_argument("--json", action="store_true")
+    args = ap.parse_args(argv)
+    rep = Reporter(args.json)
+    runner = Runner()
+
+    def on_term(signum, frame):
+        runner.cancelled = True
+        runner.kill()
+    signal.signal(signal.SIGTERM, on_term)
+    signal.signal(signal.SIGINT, on_term)
+
+    for tool in ("yt-dlp", "ffmpeg"):
+        if not shutil.which(tool):
+            rep.emit("error", message=f"{tool} is not installed")
+            return 2
+    if args.fill_genres:
+        return fill_genres(args.fill_genres, args.fallback_genre, rep)
+    if args.fill_covers:
+        return fill_covers(args.fill_covers, rep)
+    if not args.link:
+        ap.error("a Spotify or YouTube link is required")
+    try:
+        provider, kind, ident = parse_link(args.link)
+        limit = 0
+        entity_image = ""
+        if provider == "spotify":
+            entity = fetch_entity(kind, ident)
+            collection, tracks = tracks_from_entity(kind, entity)
+            if kind in ("track", "album"):  # a playlist's image is the playlist's, not the songs'
+                entity_image = Covers.spotify_image(entity)
+            if kind == "playlist" and len(tracks) == 100:
+                limit = 100  # Spotify's embed page lists at most 100 playlist tracks
+        elif kind == "track":
+            collection, tracks = None, [{"video": ident, "title": "", "artists": [], "duration": 0, "album": ""}]
+        else:
+            collection, tracks, available = youtube_collection(runner, kind, ident)
+            if available > len(tracks):
+                limit = len(tracks)
+    except Cancelled:
+        rep.emit("cancelled", done=0, skipped=0, failed=0, dir="")
+        return 130
+    except Exception as e:  # noqa: BLE001 - reported to the user
+        rep.emit("error", message=clip(str(e), 200) or "could not read link")
+        return 1
+
+    outdir = os.path.abspath(os.path.expanduser(args.out))
+    if collection:
+        outdir = os.path.join(outdir, sanitize_component(collection.lower()))
+    os.makedirs(outdir, exist_ok=True)
+    workdir = tempfile.mkdtemp(prefix=".spotify-dl-", dir=outdir)
+    total = len(tracks)
+    genres = Genres()
+    covers = Covers(genres, workdir, runner)
+    album_cover = ""  # one cover file reused for every track of an album
+    album_genre, album_genre_tried, album_artist = "", False, ""
+    done = skipped = failed = 0
+    try:
+        if provider == "youtube" and kind == "track":
+            try:
+                resolve_youtube(runner, tracks[0], workdir)
+            except Cancelled:
+                raise
+            except Exception as e:  # noqa: BLE001
+                rep.emit("error", message=clip(str(e), 200) or "could not read YouTube video")
+                return 1
+        rep.emit("start", kind=kind, provider=provider,
+                 name=collection or file_stem(tracks[0]["artists"], tracks[0]["title"]),
+                 total=total, dir=outdir, truncated=limit > 0, limit=limit)
+
+        for i, track in enumerate(tracks, 1):
+            if kind == "album":
+                track["number"] = i
+            if collection:
+                track["grouping"] = collection
+            track["source"] = kind
+            track["origin"] = provider
+            if provider == "youtube" and not track.get("info_json"):
+                try:
+                    resolve_youtube(runner, track, workdir)
+                except Cancelled:
+                    raise
+                except Exception as e:  # noqa: BLE001 - private/deleted videos etc.
+                    failed += 1
+                    rep.emit("track", index=i, total=total, name=clip(track["title"] or track["video"], 200).lower(),
+                             status="failed", error=clip(str(e), 200))
+                    continue
+            if kind == "album" and provider == "youtube":
+                album_artist = album_artist or (track["artists"][0] if track["artists"] else "")
+                track["album_artist"] = album_artist
+            stem = file_stem(track["artists"], track["title"])
+            target = os.path.join(outdir, stem + ".mp3")
+            if os.path.exists(target):
+                skipped += 1
+                rep.emit("track", index=i, total=total, name=stem, status="skipped")
+                continue
+            rep.emit("track", index=i, total=total, name=stem, status="downloading")
+            try:
+                # An album keeps one genre for all its tracks when Deezer knows it.
+                if kind == "album" and not album_genre_tried and track["artists"]:
+                    album_genre_tried = True
+                    try:
+                        album_genre = genres.from_album(track.get("album_artist") or track["artists"][0], collection)
+                    except Exception:  # noqa: BLE001 - genre is best-effort
+                        album_genre = ""
+                track["genre"] = album_genre or genres.lookup(
+                    track["artists"], FEAT_PAREN_RE.sub("", track["title"]).strip(), "", args.fallback_genre)
+                if kind == "album" and album_cover and os.path.exists(album_cover):
+                    track["cover"] = shutil.copy(album_cover, os.path.join(workdir, "cover.jpg"))
+                else:
+                    track["cover"] = covers.find(
+                        track["artists"], FEAT_PAREN_RE.sub("", track["title"]).strip(),
+                        album=collection if kind == "album" else "", album_artist=track.get("album_artist", ""),
+                        direct_url=entity_image, video_id=track.get("video", ""))
+                    if kind == "album" and track["cover"]:
+                        album_cover = shutil.copy(track["cover"], os.path.join(workdir, "album-cover.jpg"))
+                download_track(runner, track, target, workdir, covers)
+                done += 1
+                rep.emit("track", index=i, total=total, name=stem, status="done", genre=track["genre"])
+            except Cancelled:
+                raise
+            except Exception as e:  # noqa: BLE001 - keep going with the next track
+                failed += 1
+                rep.emit("track", index=i, total=total, name=stem, status="failed",
+                         error=clip(str(e), 200))
+    except Cancelled:
+        rep.emit("cancelled", done=done, skipped=skipped, failed=failed, dir=outdir)
+        return 130
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+    rep.emit("finish", done=done, skipped=skipped, failed=failed, dir=outdir)
+    return 0 if failed == 0 else 3
+
+
+if __name__ == "__main__":
+    sys.exit(main())
